@@ -14,14 +14,22 @@ namespace SimpleMagicLogin;
 
 defined( 'ABSPATH' ) || exit;
 
-function eligible( $user ) {
+/** Diagnostics go to PHP's configured error log; never include credentials or mail bodies. */
+function log_event( $event, $context = array() ) {
+	error_log( '[simple-magic-login] ' . wp_json_encode( array_merge( array( 'site_id' => get_current_blog_id(), 'event' => $event ), $context ) ) );
+}
+
+function eligible( $user, &$reason = null ) {
 	if ( ! $user instanceof \WP_User || ( is_multisite() && ( ! is_user_member_of_blog( $user->ID, get_current_blog_id() ) || $user->spam || $user->deleted ) ) ) {
+		$reason = $user ? 'not_site_member_or_disabled' : 'unknown_email';
 		return false;
 	}
 	// Email links cannot complete the Two Factor plugin's challenge flow.
 	if ( class_exists( '\Two_Factor_Core' ) && \Two_Factor_Core::is_user_using_two_factor( $user->ID ) ) {
+		$reason = 'two_factor_enabled';
 		return false;
 	}
+	$reason = 'authentication_filter_denied';
 	$checked = apply_filters( 'wp_authenticate_user', $user, '' );
 	return $checked instanceof \WP_User && $checked->ID === $user->ID
 		&& (bool) apply_filters( 'simple_magic_login_allowed', true, $user );
@@ -31,10 +39,13 @@ function meta_key() {
 	return '_simple_magic_login_' . get_current_blog_id();
 }
 
-function create_link( $user, $redirect ) {
+function create_link( $user, $redirect, &$code = null ) {
+	$code = sprintf( '%06d', random_int( 0, 999999 ) );
 	$token = bin2hex( random_bytes( 32 ) );
 	update_user_meta( $user->ID, meta_key(), array(
 		'hash' => hash( 'sha256', $token ),
+		'code_hash' => hash_hmac( 'sha256', $code, wp_salt( 'auth' ) ),
+		'code_attempts' => 0,
 		'expires' => time() + 15 * MINUTE_IN_SECONDS,
 		'password' => hash( 'sha256', $user->user_pass ),
 		'email' => $user->user_email,
@@ -61,40 +72,136 @@ function consume_link( $id, $token ) {
 	if ( ! $result ) {
 		return false;
 	}
+	return delete_record( $id, $result['record'] ) ? $result : false;
+}
+
+function delete_record( $id, $record ) {
+	global $wpdb;
 	$deleted = $wpdb->query( $wpdb->prepare(
 		"DELETE FROM $wpdb->usermeta WHERE user_id = %d AND meta_key = %s AND meta_value = %s",
-		$id, meta_key(), maybe_serialize( $result['record'] )
+		$id, meta_key(), maybe_serialize( $record )
 	) );
 	wp_cache_delete( $id, 'user_meta' );
-	return $deleted ? $result : false;
+	return (bool) $deleted;
 }
 
 function request_link( $email, $redirect ) {
 	$ip_key = 'sml_ip_' . hash( 'sha256', isset( $_SERVER['REMOTE_ADDR'] ) ? $_SERVER['REMOTE_ADDR'] : '' );
 	$attempts = (int) get_transient( $ip_key );
 	if ( $attempts >= 10 ) {
+		log_event( 'request_throttled_ip' );
 		return;
 	}
 	set_transient( $ip_key, $attempts + 1, 15 * MINUTE_IN_SECONDS );
 	$user = get_user_by( 'email', $email );
-	if ( ! eligible( $user ) ) {
+	$allowed = eligible( $user, $reason );
+	$notice = ! $allowed && 'two_factor_enabled' === $reason;
+	if ( ! $allowed && ! $notice ) {
+		log_event( 'request_blocked', array( 'reason' => $reason ) );
 		return;
 	}
 	$key = 'sml_email_' . $user->ID;
 	if ( get_transient( $key ) ) {
+		log_event( 'request_throttled_user', array( 'user_id' => $user->ID ) );
 		return;
 	}
 	set_transient( $key, 1, MINUTE_IN_SECONDS );
-	$link = create_link( $user, $redirect );
-	$record = get_user_meta( $user->ID, meta_key(), true );
-	$sent = wp_mail(
-		$user->user_email,
-		sprintf( __( '[%s] Your login link', 'simple-magic-login' ), wp_specialchars_decode( get_option( 'blogname' ), ENT_QUOTES ) ),
-		sprintf( __( "Log in using this link:\n\n%s\n\nThis link expires in 15 minutes and can be used once. If you did not request it, you can ignore this email.", 'simple-magic-login' ), $link )
-	);
-	if ( ! $sent ) {
-		delete_user_meta( $user->ID, meta_key(), $record );
+	$site_name = wp_specialchars_decode( get_option( 'blogname' ), ENT_QUOTES );
+	$record = null;
+	if ( $notice ) {
+		$subject = sprintf( __( '[%s] Log in with your password', 'simple-magic-login' ), $site_name );
+		$password_url = add_query_arg( 'password', '1', wp_login_url( wp_validate_redirect( $redirect, admin_url() ) ) );
+		$message = sprintf( __( "You requested an email login for %1\$s. Your account has two-factor authentication enabled, so email login links and codes are unavailable.\n\nLog in with your password and complete two-factor authentication here:\n\n%2\$s\n\nIf you did not request this, you can ignore this email.", 'simple-magic-login' ), $site_name, $password_url );
+	} else {
+		$link = create_link( $user, $redirect, $code );
+		$record = get_user_meta( $user->ID, meta_key(), true );
+		$subject = sprintf( __( '[%s] Your login link and code', 'simple-magic-login' ), $site_name );
+		$message = sprintf( __( "Log in using this link:\n\n%1\$s\n\nOr enter this six-digit code on the login page with your email address: %2\$s\n\nThe link and code expire in 15 minutes. Using either invalidates both. If you did not request this, ignore this email.", 'simple-magic-login' ), $link, $code );
 	}
+	$mail_failure = function ( $error ) use ( $user ) {
+		// Never log WP_Error data: it contains the full email and credentials.
+		$message = preg_replace( array( '~https?://\\S+~i', '/[A-Z0-9._%+\\-]+@[A-Z0-9.\\-]+/i', '/\\b(?:[a-f0-9]{64}|[0-9]{6})\\b/i' ), '[redacted]', $error->get_error_message() );
+		log_event( 'mail_transport_error', array( 'user_id' => $user->ID, 'error_codes' => $error->get_error_codes(), 'message' => substr( sanitize_text_field( $message ), 0, 500 ) ) );
+	};
+	add_action( 'wp_mail_failed', $mail_failure );
+	try {
+		$sent = wp_mail( $user->user_email, $subject, $message );
+	} finally {
+		remove_action( 'wp_mail_failed', $mail_failure );
+	}
+	log_event( $sent ? 'mail_accepted' : 'mail_failed', array( 'user_id' => $user->ID, 'mail_type' => $notice ? 'two_factor_notice' : 'login_credentials' ) );
+	if ( ! $sent && $record ) {
+		delete_record( $user->ID, $record );
+	}
+
+}
+
+/** Reserve an attempt atomically so parallel requests cannot bypass the limit. */
+function consume_code( $email, $code ) {
+	global $wpdb;
+	$user = get_user_by( 'email', $email );
+	if ( ! eligible( $user ) ) return false;
+	$id = $user->ID;
+	$data = get_user_meta( $id, meta_key(), true );
+	if ( ! is_array( $data ) || empty( $data['code_hash'] ) || $data['expires'] <= time()
+		|| $data['code_attempts'] >= 5 || $data['email'] !== $user->user_email
+		|| ! hash_equals( $data['password'], hash( 'sha256', $user->user_pass ) ) ) return false;
+	$next = $data;
+	++$next['code_attempts'];
+	$updated = $wpdb->query( $wpdb->prepare(
+		"UPDATE $wpdb->usermeta SET meta_value = %s WHERE user_id = %d AND meta_key = %s AND meta_value = %s",
+		maybe_serialize( $next ), $id, meta_key(), maybe_serialize( $data )
+	) );
+	wp_cache_delete( $id, 'user_meta' );
+	if ( ! $updated ) return false;
+	if ( ! preg_match( '/^[0-9]{6}$/D', $code ) || ! hash_equals( $data['code_hash'], hash_hmac( 'sha256', $code, wp_salt( 'auth' ) ) ) ) {
+		log_event( 'code_rejected', array( 'user_id' => $id, 'attempt' => $next['code_attempts'] ) );
+		return false;
+	}
+	return delete_record( $id, $next ) ? array( 'user' => $user, 'redirect' => $data['redirect'] ) : false;
+}
+
+function code_form() {
+	?>
+	<details id="sml-code-login" style="width:320px;margin:24px auto" <?php echo isset( $_GET['code_error'] ) ? 'open' : ''; ?>>
+		<summary><?php esc_html_e( 'Have a six-digit login code?', 'simple-magic-login' ); ?></summary>
+		<form method="post" action="<?php echo esc_url( add_query_arg( 'action', 'simple_magic_code', site_url( 'wp-login.php', 'login_post' ) ) ); ?>">
+			<p><label for="sml-code-email"><?php esc_html_e( 'Email Address', 'simple-magic-login' ); ?></label>
+			<input class="input" type="email" name="email" id="sml-code-email" autocomplete="email" required></p>
+			<p><label for="sml-code"><?php esc_html_e( 'Six-digit code', 'simple-magic-login' ); ?></label>
+			<input class="input" type="text" name="code" id="sml-code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" required></p>
+			<?php wp_nonce_field( 'sml_code_login', '_sml_code_nonce', false ); ?>
+			<p class="forgetmenot"><label><input type="checkbox" name="rememberme" value="forever"> <?php esc_html_e( 'Remember Me', 'simple-magic-login' ); ?></label></p>
+			<p class="submit"><button class="button button-primary" type="submit"><?php esc_html_e( 'Log In', 'simple-magic-login' ); ?></button></p>
+		</form>
+	</details>
+	<script>
+	(function () {
+		var codeForm = document.getElementById('sml-code-login');
+		var login = document.getElementById('login');
+		if (codeForm && login) {
+			codeForm.style.width = 'auto';
+			codeForm.style.margin = '24px 0';
+			login.appendChild(codeForm);
+		}
+	})();
+	</script>
+	<?php
+}
+
+function redeem_code() {
+	nocache_headers();
+	$result = false;
+	if ( 'POST' === ( $_SERVER['REQUEST_METHOD'] ?? 'GET' ) && wp_verify_nonce( input( $_POST, '_sml_code_nonce' ), 'sml_code_login' ) ) {
+		$result = consume_code( sanitize_email( input( $_POST, 'email' ) ), trim( input( $_POST, 'code' ) ) );
+	}
+	if ( ! $result ) {
+		log_event( 'code_login_failed' );
+		wp_safe_redirect( add_query_arg( 'code_error', '1', site_url( 'wp-login.php', 'login' ) ) . '#sml-code-login' );
+		exit;
+	}
+	log_event( 'code_login_succeeded', array( 'user_id' => $result['user']->ID ) );
+	complete_login( $result );
 }
 
 function input( $source, $key ) {
@@ -114,18 +221,25 @@ function login_page() {
 			$email = sanitize_email( input( $_POST, 'log' ) );
 			if ( is_email( $email ) ) {
 				request_link( $email, $redirect );
+			} else {
+				log_event( 'request_invalid_email' );
 			}
 			$status = 'sent';
 		}
+		if ( 'form_expired' === $status ) log_event( 'request_invalid_nonce' );
 		wp_safe_redirect( add_query_arg( array( $status => '1', 'redirect_to' => $redirect ), site_url( 'wp-login.php', 'login' ) ) );
 		exit;
 	}
 	add_filter( 'wp_login_errors', __NAMESPACE__ . '\\login_messages' );
 	add_action( 'login_form', __NAMESPACE__ . '\\email_controls' );
 	add_action( 'login_footer', __NAMESPACE__ . '\\adapt_login_form' );
+	add_action( 'login_footer', __NAMESPACE__ . '\\code_form' );
 }
 
 function login_messages( $errors ) {
+	if ( isset( $_GET['code_error'] ) ) {
+		$errors->add( 'sml_code', __( 'The code is invalid or expired. After five incorrect attempts, request a new email.', 'simple-magic-login' ) );
+	}
 	if ( isset( $_GET['sent'] ) ) {
 		$errors->add( 'sml_sent', __( 'If this email belongs to an account on this site, a login link has been sent. Please check your inbox.', 'simple-magic-login' ), 'message' );
 	}
@@ -264,6 +378,11 @@ function redeem() {
 		login_footer();
 		exit;
 	}
+	complete_login( $result );
+}
+
+function complete_login( $result ) {
+	$user = $result['user'];
 	wp_set_current_user( $user->ID );
 	wp_set_auth_cookie( $user->ID, 'forever' === input( $_POST, 'rememberme' ) );
 	do_action( 'wp_login', $user->user_login, $user );
@@ -274,3 +393,5 @@ function redeem() {
 
 add_action( 'login_form_login', __NAMESPACE__ . '\\login_page' );
 add_action( 'login_form_simple_magic_login', __NAMESPACE__ . '\\redeem' );
+
+add_action( 'login_form_simple_magic_code', __NAMESPACE__ . '\\redeem_code' );

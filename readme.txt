@@ -13,7 +13,11 @@ unless you want it on every site. Keep the original Magic Login plugin inactive
 on those sites to avoid competing login handlers. There are no settings screens.
 
 wp-login.php asks for an email address. Existing members of that site receive a
-single-use link valid for 15 minutes. Requesting a new link replaces the old one.
+single-use link and six-digit code valid for 15 minutes. Open “Have a six-digit
+login code?” on the login page to enter your email and code on another device.
+Using either the link or the code invalidates both. Five incorrect code attempts
+disable that code; the long login link still works. Requesting a new email
+replaces both the old link and code. No custom tables are created.
 Password or email changes invalidate outstanding links. Known and unknown emails
 receive the same response text (delivery timing can differ). Requests are limited to one email per user per minute
 and ten attempts per direct IP address per 15 minutes of inactivity.
@@ -39,7 +43,10 @@ consumes the link, so ordinary email link scanners do not sign in or use it up.
 
 WordPress wp_authenticate_user restrictions are checked before sending and
 redeeming a link. Users with the Two Factor plugin enabled must use password
-login. Other MFA/SSO plugins that depend on the authenticate filter or native
+login. They receive an explanatory email with a password login link instead of
+a login token or code, subject to the same email and IP throttling. Delivery logs
+identify these messages with mail_type two_factor_notice.
+Other MFA/SSO plugins that depend on the authenticate filter or native
 login form need separate integration; their challenges are not run by this flow.
 Use the simple_magic_login_allowed filter to exclude affected accounts.
 Request throttling uses transients and is best effort under concurrent requests.
@@ -50,3 +57,15 @@ the account's existing permissions elsewhere in the network.
 
 Activation example:
 wp --url=alex.kirk.at plugin activate simple-magic-login
+
+== Troubleshooting email ==
+
+Diagnostics are written to PHP's configured error log with the prefix
+[simple-magic-login]. When WordPress debug logging is configured, this normally
+means WP_DEBUG_LOG; otherwise check the PHP/web server error log.
+Entries include the site ID, user ID where applicable, and the outcome:
+request_blocked (with reason), request_throttled_ip, request_throttled_user,
+request_invalid_nonce, request_invalid_email, mail_transport_error, mail_failed,
+or mail_accepted. Transport errors include a redacted error message, never the
+mail body. Login links, codes, email addresses, and raw IP addresses are not logged.
+mail_accepted means wp_mail returned success, not that the email reached an inbox.
