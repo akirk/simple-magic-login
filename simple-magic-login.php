@@ -87,12 +87,12 @@ function delete_record( $id, $record ) {
 
 function request_link( $email, $redirect ) {
 	$ip_key = 'sml_ip_' . hash( 'sha256', isset( $_SERVER['REMOTE_ADDR'] ) ? $_SERVER['REMOTE_ADDR'] : '' );
-	$attempts = (int) get_transient( $ip_key );
+	$attempts = (int) get_site_transient( $ip_key );
 	if ( $attempts >= 10 ) {
 		log_event( 'request_throttled_ip' );
 		return;
 	}
-	set_transient( $ip_key, $attempts + 1, 15 * MINUTE_IN_SECONDS );
+	set_site_transient( $ip_key, $attempts + 1, 15 * MINUTE_IN_SECONDS );
 	$user = get_user_by( 'email', $email );
 	$allowed = eligible( $user, $reason );
 	$notice = ! $allowed && 'two_factor_enabled' === $reason;
@@ -101,11 +101,11 @@ function request_link( $email, $redirect ) {
 		return;
 	}
 	$key = 'sml_email_' . $user->ID;
-	if ( get_transient( $key ) ) {
+	if ( get_site_transient( $key ) ) {
 		log_event( 'request_throttled_user', array( 'user_id' => $user->ID ) );
 		return;
 	}
-	set_transient( $key, 1, MINUTE_IN_SECONDS );
+	set_site_transient( $key, 1, MINUTE_IN_SECONDS );
 	$site_name = wp_specialchars_decode( get_option( 'blogname' ), ENT_QUOTES );
 	$record = null;
 	if ( $notice ) {

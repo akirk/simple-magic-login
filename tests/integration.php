@@ -3,6 +3,8 @@
 require_once dirname( __DIR__ ) . '/simple-magic-login.php';
 function sml_assert($ok, $message) { if (!$ok) { throw new Exception($message); } echo "PASS: $message\n"; }
 add_filter('pre_wp_mail', '__return_true');
+$original_ip=$_SERVER['REMOTE_ADDR'] ?? null;
+$_SERVER['REMOTE_ADDR']='2001:db8::'.bin2hex(random_bytes(2)).':'.bin2hex(random_bytes(2));
 $id = wp_insert_user(array('user_login'=>'sml-test-'.wp_generate_password(10,false), 'user_email'=>'sml-test-'.wp_generate_password(10,false).'@example.invalid','user_pass'=>wp_generate_password(32),'role'=>'subscriber'));
 if (is_wp_error($id)) { throw new Exception($id->get_error_message()); }
 try {
@@ -62,7 +64,20 @@ try {
  SimpleMagicLogin\request_link($user->user_email,admin_url());
  sml_assert($mail && $mail['to']===$user->user_email && strpos($mail['message'],'action=simple_magic_login')!==false,'Generate email without sending');
  $mail=null; SimpleMagicLogin\request_link($user->user_email,admin_url()); sml_assert(!$mail,'Throttle repeat email');
- delete_transient('sml_email_'.$id);
+ switch_to_blog(1);
+ try {
+  add_user_to_blog(1,$id,'subscriber');
+  $mail=null;SimpleMagicLogin\request_link($user->user_email,admin_url());
+  sml_assert(!$mail && (bool)get_site_transient('sml_email_'.$id),'User throttle applies across subsites');
+  $ip_key='sml_ip_'.hash('sha256',$_SERVER['REMOTE_ADDR']);
+  set_site_transient($ip_key,10,15*MINUTE_IN_SECONDS);
+ } finally { restore_current_blog(); }
+ delete_site_transient('sml_email_'.$id);
+ $mail=null;SimpleMagicLogin\request_link($user->user_email,admin_url());
+ sml_assert(!$mail && (int)get_site_transient($ip_key)===10,'IP throttle applies across subsites');
+ delete_site_transient($ip_key);
+
+ delete_site_transient('sml_email_'.$id);
  $log_path=tempnam(sys_get_temp_dir(),'sml-log-');$old_log=ini_get('error_log');ini_set('error_log',$log_path);
  $fail=function(){do_action('wp_mail_failed',new WP_Error('wp_mail_failed','Simulated failure: secret@example.invalid https://example.invalid/?token='.str_repeat('a',64).' code 123456'));return false;};add_filter('pre_wp_mail',$fail,99);
  SimpleMagicLogin\request_link($user->user_email,admin_url());remove_filter('pre_wp_mail',$fail,99);
@@ -74,7 +89,7 @@ try {
  require_once dirname(__DIR__,2).'/two-factor/class-two-factor-core.php';
  $require_two_factor=function($required,$candidate)use($id){return $candidate->ID===$id ? true : $required;};
  add_filter('two_factor_is_required_for_user',$require_two_factor,10,2);
- delete_transient('sml_email_'.$id);
+ delete_site_transient('sml_email_'.$id);
  delete_user_meta($id,SimpleMagicLogin\meta_key());
  $mail=null;
  SimpleMagicLogin\request_link($user->user_email,admin_url());
@@ -85,7 +100,8 @@ try {
  remove_filter('two_factor_is_required_for_user',$require_two_factor,10);
 
 } finally {
- delete_transient('sml_email_'.$id);
- delete_transient('sml_ip_'.hash('sha256',isset($_SERVER['REMOTE_ADDR'])?$_SERVER['REMOTE_ADDR']:''));
+ delete_site_transient('sml_email_'.$id);
+ delete_site_transient('sml_ip_'.hash('sha256',isset($_SERVER['REMOTE_ADDR'])?$_SERVER['REMOTE_ADDR']:''));
+ if($original_ip===null)unset($_SERVER['REMOTE_ADDR']);else $_SERVER['REMOTE_ADDR']=$original_ip;
  require_once ABSPATH.'wp-admin/includes/ms.php'; wpmu_delete_user($id);
 }
