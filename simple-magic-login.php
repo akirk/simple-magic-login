@@ -16,6 +16,7 @@ defined( 'ABSPATH' ) || exit;
 
 /** Diagnostics go to PHP's configured error log; never include credentials or mail bodies. */
 function log_event( $event, $context = array() ) {
+	// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- Operational delivery diagnostics are documented and redact credentials.
 	error_log( '[simple-magic-login] ' . wp_json_encode( array_merge( array( 'site_id' => get_current_blog_id(), 'event' => $event ), $context ) ) );
 }
 
@@ -30,8 +31,10 @@ function eligible( $user, &$reason = null ) {
 		return false;
 	}
 	$reason = 'authentication_filter_denied';
+	// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Apply the existing WordPress account restriction hook.
 	$checked = apply_filters( 'wp_authenticate_user', $user, '' );
 	return $checked instanceof \WP_User && $checked->ID === $user->ID
+		// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Public plugin hook uses the full simple_magic_login prefix.
 		&& (bool) apply_filters( 'simple_magic_login_allowed', true, $user );
 }
 
@@ -77,6 +80,7 @@ function consume_link( $id, $token ) {
 
 function delete_record( $id, $record ) {
 	global $wpdb;
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Atomic compare-and-delete prevents token reuse; user_meta cache is invalidated below.
 	$deleted = $wpdb->query( $wpdb->prepare(
 		"DELETE FROM $wpdb->usermeta WHERE user_id = %d AND meta_key = %s AND meta_value = %s",
 		$id, meta_key(), maybe_serialize( $record )
@@ -86,7 +90,7 @@ function delete_record( $id, $record ) {
 }
 
 function request_link( $email, $redirect ) {
-	$ip_key = 'sml_ip_' . hash( 'sha256', isset( $_SERVER['REMOTE_ADDR'] ) ? $_SERVER['REMOTE_ADDR'] : '' );
+	$ip_key = 'sml_ip_' . hash( 'sha256', sanitize_text_field( input( $_SERVER, 'REMOTE_ADDR' ) ) );
 	$attempts = (int) get_site_transient( $ip_key );
 	if ( $attempts >= 10 ) {
 		log_event( 'request_throttled_ip' );
@@ -109,13 +113,17 @@ function request_link( $email, $redirect ) {
 	$site_name = wp_specialchars_decode( get_option( 'blogname' ), ENT_QUOTES );
 	$record = null;
 	if ( $notice ) {
+		/* translators: %s: Site name. */
 		$subject = sprintf( __( '[%s] Log in with your password', 'simple-magic-login' ), $site_name );
 		$password_url = add_query_arg( 'password', '1', wp_login_url( wp_validate_redirect( $redirect, admin_url() ) ) );
+		/* translators: 1: Site name, 2: Password login URL. */
 		$message = sprintf( __( "You requested an email login for %1\$s. Your account has two-factor authentication enabled, so email login links and codes are unavailable.\n\nLog in with your password and complete two-factor authentication here:\n\n%2\$s\n\nIf you did not request this, you can ignore this email.", 'simple-magic-login' ), $site_name, $password_url );
 	} else {
 		$link = create_link( $user, $redirect, $code );
 		$record = get_user_meta( $user->ID, meta_key(), true );
+		/* translators: %s: Site name. */
 		$subject = sprintf( __( '[%s] Your login link and code', 'simple-magic-login' ), $site_name );
+		/* translators: 1: Single-use login URL, 2: Six-digit login code. */
 		$message = sprintf( __( "Log in using this link:\n\n%1\$s\n\nOr enter this six-digit code on the login page with your email address: %2\$s\n\nThe link and code expire in 15 minutes. Using either invalidates both. If you did not request this, ignore this email.", 'simple-magic-login' ), $link, $code );
 	}
 	$mail_failure = function ( $error ) use ( $user ) {
@@ -148,6 +156,7 @@ function consume_code( $email, $code ) {
 		|| ! hash_equals( $data['password'], hash( 'sha256', $user->user_pass ) ) ) return false;
 	$next = $data;
 	++$next['code_attempts'];
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Atomic compare-and-swap reserves a code attempt; user_meta cache is invalidated below.
 	$updated = $wpdb->query( $wpdb->prepare(
 		"UPDATE $wpdb->usermeta SET meta_value = %s WHERE user_id = %d AND meta_key = %s AND meta_value = %s",
 		maybe_serialize( $next ), $id, meta_key(), maybe_serialize( $data )
@@ -163,7 +172,10 @@ function consume_code( $email, $code ) {
 
 function code_form() {
 	?>
-	<details id="sml-code-login" style="width:320px;margin:24px auto" <?php echo isset( $_GET['code_error'] ) ? 'open' : ''; ?>>
+	<details id="sml-code-login" style="width:320px;margin:24px auto" <?php
+	// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only display flag.
+	echo isset( $_GET['code_error'] ) ? 'open' : '';
+	?>>
 		<summary><?php esc_html_e( 'Have a six-digit login code?', 'simple-magic-login' ); ?></summary>
 		<form method="post" action="<?php echo esc_url( add_query_arg( 'action', 'simple_magic_code', site_url( 'wp-login.php', 'login_post' ) ) ); ?>">
 			<p><label for="sml-code-email"><?php esc_html_e( 'Email Address', 'simple-magic-login' ); ?></label>
@@ -192,7 +204,7 @@ function code_form() {
 function redeem_code() {
 	nocache_headers();
 	$result = false;
-	if ( 'POST' === ( $_SERVER['REQUEST_METHOD'] ?? 'GET' ) && wp_verify_nonce( input( $_POST, '_sml_code_nonce' ), 'sml_code_login' ) ) {
+	if ( isset( $_POST['_sml_code_nonce'] ) && wp_verify_nonce( input( $_POST, '_sml_code_nonce' ), 'sml_code_login' ) ) {
 		$result = consume_code( sanitize_email( input( $_POST, 'email' ) ), trim( input( $_POST, 'code' ) ) );
 	}
 	if ( ! $result ) {
@@ -210,14 +222,16 @@ function input( $source, $key ) {
 
 /** Handle email requests, then let wp-login.php render its own form. */
 function login_page() {
-	$is_post = 'POST' === ( $_SERVER['REQUEST_METHOD'] ?? 'GET' );
+	$is_post = ! empty( $_POST );
+	// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only login status or password display flag.
 	if ( isset( $_GET['password'] ) || ! empty( $_REQUEST['interim-login'] ) || ( $is_post && ! isset( $_POST['simple_magic_login'] ) ) ) {
 		return;
 	}
 	if ( $is_post ) {
-		$redirect = wp_validate_redirect( input( $_POST, 'redirect_to' ), admin_url() );
+		$redirect = admin_url();
 		$status = 'form_expired';
 		if ( wp_verify_nonce( input( $_POST, '_sml_nonce' ), 'simple_magic_login_request' ) ) {
+			$redirect = wp_validate_redirect( input( $_POST, 'redirect_to' ), admin_url() );
 			$email = sanitize_email( input( $_POST, 'log' ) );
 			if ( is_email( $email ) ) {
 				request_link( $email, $redirect );
@@ -237,15 +251,19 @@ function login_page() {
 }
 
 function login_messages( $errors ) {
+	// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only login status or password display flag.
 	if ( isset( $_GET['code_error'] ) ) {
 		$errors->add( 'sml_code', __( 'The code is invalid or expired. After five incorrect attempts, request a new email.', 'simple-magic-login' ) );
 	}
+	// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only login status or password display flag.
 	if ( isset( $_GET['sent'] ) ) {
 		$errors->add( 'sml_sent', __( 'If this email belongs to an account on this site, a login link has been sent. Please check your inbox.', 'simple-magic-login' ), 'message' );
 	}
+	// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only login status or password display flag.
 	if ( isset( $_GET['invalid_link'] ) ) {
 		$errors->add( 'sml_invalid', __( 'This login link is invalid or expired. Please request a new one.', 'simple-magic-login' ) );
 	}
+	// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only login status or password display flag.
 	if ( isset( $_GET['form_expired'] ) ) {
 		$errors->add( 'sml_expired', __( 'This form expired. Please try again.', 'simple-magic-login' ) );
 	}
@@ -278,7 +296,10 @@ function adapt_login_form() {
 		if (!login || !password || !wrap || !submit || !label) return;
 		var original = { label: label.textContent, type: login.type, autocomplete: login.autocomplete, submit: submit.value, required: password.required, disabled: password.disabled, rememberDisabled: remember && remember.disabled };
 		var toggle = document.createElement('a');
-		toggle.href = <?php echo wp_json_encode( add_query_arg( 'password', '1', wp_login_url( input( $_REQUEST, 'redirect_to' ) ) ) ); ?>;
+		toggle.href = <?php
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only redirect passed to WordPress login URL generation and JSON encoded.
+		echo wp_json_encode( add_query_arg( 'password', '1', wp_login_url( input( $_REQUEST, 'redirect_to' ) ) ) );
+		?>;
 		toggle.style.display = 'inline-flex';
 		toggle.style.alignItems = 'center';
 		toggle.style.gap = '4px';
@@ -353,9 +374,11 @@ function adapt_login_form() {
 function redeem() {
 	nocache_headers();
 	header( 'Referrer-Policy: no-referrer' );
+	// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only token validation; consumption requires the POST nonce below.
 	$id = absint( input( $_GET, 'uid' ) );
+	// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Token format is validated by validate_link; consumption requires the POST nonce below.
 	$token = input( $_GET, 'token' );
-	$is_post = 'POST' === $_SERVER['REQUEST_METHOD'];
+	$is_post = isset( $_POST['_wpnonce'] );
 	$result = validate_link( $id, $token );
 	if ( $result && $is_post ) {
 		$result = wp_verify_nonce( input( $_POST, '_wpnonce' ), 'sml_redeem_' . $token ) ? consume_link( $id, $token ) : false;
@@ -369,6 +392,7 @@ function redeem() {
 		login_header( __( 'Confirm login', 'simple-magic-login' ) );
 		?>
 		<form method="post" action="<?php echo esc_url( add_query_arg( array( 'action' => 'simple_magic_login', 'uid' => $id, 'token' => $token ), site_url( 'wp-login.php', 'login' ) ) ); ?>">
+			<?php /* translators: %s: Account email address. */ ?>
 			<p><?php echo esc_html( sprintf( __( 'Log in as %s?', 'simple-magic-login' ), $user->user_email ) ); ?></p>
 			<?php wp_nonce_field( 'sml_redeem_' . $token ); ?>
 			<p class="forgetmenot"><label for="rememberme"><input name="rememberme" type="checkbox" id="rememberme" value="forever"> <?php esc_html_e( 'Remember Me', 'simple-magic-login' ); ?></label></p>
@@ -384,8 +408,11 @@ function redeem() {
 function complete_login( $result ) {
 	$user = $result['user'];
 	wp_set_current_user( $user->ID );
+	// phpcs:ignore WordPress.Security.NonceVerification.Missing -- Both callers verify their form nonce before completing login.
 	wp_set_auth_cookie( $user->ID, 'forever' === input( $_POST, 'rememberme' ) );
+	// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Notify the existing WordPress login hook.
 	do_action( 'wp_login', $user->user_login, $user );
+	// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- Honor the existing WordPress redirect hook.
 	$redirect = apply_filters( 'login_redirect', $result['redirect'], $result['redirect'], $user );
 	wp_safe_redirect( $redirect );
 	exit;
