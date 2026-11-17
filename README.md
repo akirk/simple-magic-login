@@ -1,13 +1,17 @@
-=== Simple Magic Login ===
-Contributors: akirk
-Requires PHP: 7.4
-Stable tag: 0.1.0
-License: GPLv2 or later
+# Simple Magic Login
+
+- Contributors: akirk
+- Requires PHP: 7.4
+- Stable tag: 0.1.0
+- License: GPLv2 or later
 
 Minimal email-link login, inspired by Magic Login by HandyPlugins.
 This is an independent reimplementation, with no dependency on Magic Login.
 
-== Usage ==
+## Description
+
+### Usage
+
 Activate on each site that should use email-first login. Do not network activate
 unless you want it on every site. Keep the original Magic Login plugin inactive
 on those sites to avoid competing login handlers. There are no settings screens.
@@ -60,9 +64,12 @@ normal login session. A successful login uses the network's standard cookies and
 the account's existing permissions elsewhere in the network.
 
 Activation example:
-wp --url=alex.kirk.at plugin activate simple-magic-login
 
-== Troubleshooting email ==
+```sh
+wp --url=alex.kirk.at plugin activate simple-magic-login
+```
+
+### Troubleshooting email
 
 Diagnostics are written to PHP's configured error log with the prefix
 [simple-magic-login]. When WordPress debug logging is configured, this normally
