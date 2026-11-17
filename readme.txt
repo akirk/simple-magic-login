@@ -20,7 +20,10 @@ disable that code; the long login link still works. Requesting a new email
 replaces both the old link and code. No custom tables are created.
 Password or email changes invalidate outstanding links. Known and unknown emails
 receive the same response text (delivery timing can differ). Requests are limited to one email per user per minute
-and ten attempts per direct IP address per 15 minutes of inactivity.
+and ten attempts per direct IP address per 15 minutes of inactivity. Both limits
+are shared across all sites in the same multisite network, including when the
+plugin is activated on individual sites. On a single-site install they apply
+to that site.
 
 “Log in with password” reveals the password field and changes the submit button
 to “Log In”.
@@ -49,7 +52,8 @@ identify these messages with mail_type two_factor_notice.
 Other MFA/SSO plugins that depend on the authenticate filter or native
 login form need separate integration; their challenges are not run by this flow.
 Use the simple_magic_login_allowed filter to exclude affected accounts.
-Request throttling uses transients and is best effort under concurrent requests.
+Request throttling uses network transients and is best effort under concurrent
+requests. Login links and codes remain bound to the site that issued them.
 
 Site-bound links limit where a link is redeemed, not the scope of WordPress's
 normal login session. A successful login uses the network's standard cookies and
